@@ -6,54 +6,174 @@
 <title>DawnV Music</title>
 <style>
     html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
-    #player { width: 100%; height: 100%; }
+    .box { width: 100%; height: 100%; display: none; }
+    .box.active { display: block; }
+    .box iframe { width: 100%; height: 100%; border: 0; }
 </style>
 </head>
 <body>
-<div id="player"></div>
+<div class="box" id="yt-box"><div id="yt-player"></div></div>
+<div class="box" id="sc-box"></div>
+<!-- SoundCloud-API synchron vor dem Steuer-Script, damit SC.Widget sofort verfuegbar ist -->
+<script src="https://w.soundcloud.com/player/api.js"></script>
 <script>
 // Zwischenseite fuer den DawnV-Loadingscreen (dawnv_loadingscreenv2).
 // YouTube spielt eingebettete Videos nur auf echten Webseiten ab (sonst Fehler 153),
 // der Loadingscreen laeuft aber unter nui://. Er bindet deshalb diese Seite ein und
-// steuert den Player per postMessage. Live-Kopie: https://reinert-digital.github.io/dawnv-music/
-var player = null;
-var ready = false;
+// steuert YouTube bzw. SoundCloud per postMessage. Optional wird nach 'limit' Sekunden
+// ausgeblendet und "ended" gemeldet (Intro-Ausschnitte).
+// Live-Kopie: https://reinert-digital.github.io/dawnv-music/ (Repo Reinert-Digital/dawnv-music)
+var FADE_SECONDS = 3;
+
+var yt = null, ytReady = false, pendingYt = null;
+var sc = null, scFrame = null, scReady = false, pendingSc = null;
+var active = null;
+var volume = 30, muted = false, fade = 1;
+var limit = 0, limitDone = false;
 
 function send(msg) {
     msg.dawnv = true;
     if (window.parent !== window) window.parent.postMessage(msg, "*");
 }
 
+function applyVolume() {
+    var v = muted ? 0 : Math.round(volume * fade);
+    if (ytReady) yt.setVolume(v);
+    if (scReady) sc.setVolume(v);
+}
+
+function show(which) {
+    document.getElementById("yt-box").classList.toggle("active", which === "youtube");
+    document.getElementById("sc-box").classList.toggle("active", which === "soundcloud");
+}
+
+function stopAll() {
+    if (ytReady) yt.stopVideo();
+    if (scReady) sc.pause();
+}
+
+// Intro-Limit: kurz vor Ende ausblenden, danach stoppen und "ended" melden
+function checkLimit(seconds) {
+    if (!limit || limitDone) return;
+    var left = limit - seconds;
+    if (left <= 0) {
+        limitDone = true;
+        stopAll();
+        send({ type: "ended" });
+    } else if (left < FADE_SECONDS) {
+        fade = left / FADE_SECONDS;
+        applyVolume();
+    }
+}
+
+// ---------------------------------------------------------------- YouTube
 function onYouTubeIframeAPIReady() {
-    player = new YT.Player("player", {
+    yt = new YT.Player("yt-player", {
         width: "100%",
         height: "100%",
         playerVars: { controls: 0, disablekb: 1, playsinline: 1, rel: 0 },
         events: {
-            onReady: function () { ready = true; send({ type: "ready" }); },
+            onReady: function () {
+                ytReady = true;
+                applyVolume();
+                if (pendingYt) { yt.loadVideoById(pendingYt); pendingYt = null; }
+            },
             onStateChange: function (e) {
+                if (active !== "youtube") return;
                 if (e.data === YT.PlayerState.ENDED) send({ type: "ended" });
                 else if (e.data === YT.PlayerState.PLAYING) send({ type: "playing" });
             },
-            onError: function (e) { send({ type: "error", code: e.data }); }
+            onError: function (e) { if (active === "youtube") send({ type: "error", code: e.data }); }
         }
     });
 }
 
+setInterval(function () {
+    if (active === "youtube" && ytReady && yt.getPlayerState() === YT.PlayerState.PLAYING) {
+        checkLimit(yt.getCurrentTime());
+    }
+}, 250);
+
+// ---------------------------------------------------------------- SoundCloud
+var SC_OPTIONS = { auto_play: true, visual: true, show_comments: false, show_user: true, hide_related: true };
+
+function loadSoundCloud(url) {
+    if (!scFrame) {
+        var params = Object.keys(SC_OPTIONS).map(function (k) { return k + "=" + SC_OPTIONS[k]; }).join("&");
+        scFrame = document.createElement("iframe");
+        scFrame.allow = "autoplay; encrypted-media";
+        scFrame.src = "https://w.soundcloud.com/player/?url=" + encodeURIComponent(url) + "&" + params;
+        document.getElementById("sc-box").appendChild(scFrame);
+        sc = SC.Widget(scFrame);
+        sc.bind(SC.Widget.Events.READY, function () {
+            scReady = true;
+            applyVolume();
+            sc.bind(SC.Widget.Events.PLAY, function () { if (active === "soundcloud") send({ type: "playing" }); });
+            sc.bind(SC.Widget.Events.FINISH, function () { if (active === "soundcloud" && !limitDone) send({ type: "ended" }); });
+            sc.bind(SC.Widget.Events.ERROR, function () { if (active === "soundcloud") send({ type: "error" }); });
+            sc.bind(SC.Widget.Events.PLAY_PROGRESS, function (e) {
+                if (active === "soundcloud") checkLimit(e.currentPosition / 1000);
+            });
+            if (pendingSc) { var next = pendingSc; pendingSc = null; loadSoundCloud(next); }
+            else sc.play();
+        });
+    } else if (scReady) {
+        var opts = Object.assign({}, SC_OPTIONS, { callback: function () { applyVolume(); sc.play(); } });
+        sc.load(url, opts);
+    } else {
+        pendingSc = url;
+    }
+}
+
+// ---------------------------------------------------------------- Steuerung
 window.addEventListener("message", function (e) {
     var d = e.data;
-    if (!ready || !d || d.dawnv !== true) return;
+    if (!d || d.dawnv !== true) return;
     switch (d.type) {
         case "load":
-            if (/^[A-Za-z0-9_-]{11}$/.test(d.id)) player.loadVideoById(d.id);
+            stopAll();
+            limit = Math.max(0, Number(d.limit) || 0);
+            limitDone = false;
+            fade = 1;
+            if (d.source === "youtube" && /^[A-Za-z0-9_-]{11}$/.test(d.id)) {
+                active = "youtube";
+                applyVolume();
+                if (ytReady) yt.loadVideoById(d.id); else pendingYt = d.id;
+            } else if (d.source === "soundcloud" && /^https:\/\/soundcloud\.com\/[\w\-\/]+$/.test(d.id)) {
+                active = "soundcloud";
+                applyVolume();
+                loadSoundCloud(d.id);
+            } else {
+                active = null;
+                send({ type: "error" });
+            }
+            show(active);
             break;
-        case "play": player.playVideo(); break;
-        case "pause": player.pauseVideo(); break;
-        case "stop": player.stopVideo(); break;
-        case "volume": player.setVolume(Math.max(0, Math.min(100, Number(d.value) || 0))); break;
-        case "mute": if (d.value) player.mute(); else player.unMute(); break;
+        case "play":
+            if (active === "youtube" && ytReady) yt.playVideo();
+            else if (active === "soundcloud" && scReady) sc.play();
+            break;
+        case "pause":
+            if (active === "youtube" && ytReady) yt.pauseVideo();
+            else if (active === "soundcloud" && scReady) sc.pause();
+            break;
+        case "stop":
+            stopAll();
+            active = null;
+            show(null);
+            break;
+        case "volume":
+            volume = Math.max(0, Math.min(100, Number(d.value) || 0));
+            applyVolume();
+            break;
+        case "mute":
+            muted = !!d.value;
+            applyVolume();
+            break;
     }
 });
+
+send({ type: "ready" });
 </script>
 <script src="https://www.youtube.com/iframe_api"></script>
 </body>
