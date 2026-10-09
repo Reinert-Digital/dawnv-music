@@ -52,6 +52,15 @@ function stopAll() {
     if (scReady) sc.pause();
 }
 
+// Fortschritt (0..1) fuer den Balken im Musik-Widget, hoechstens 4x pro Sekunde
+var lastProgress = 0;
+function reportProgress(value) {
+    var now = Date.now();
+    if (now - lastProgress < 250 || !isFinite(value)) return;
+    lastProgress = now;
+    send({ type: "progress", value: Math.max(0, Math.min(1, value)) });
+}
+
 // Intro-Limit: kurz vor Ende ausblenden, danach stoppen und "ended" melden
 function checkLimit(seconds) {
     if (!limit || limitDone) return;
@@ -90,16 +99,24 @@ function onYouTubeIframeAPIReady() {
 
 setInterval(function () {
     if (active === "youtube" && ytReady && yt.getPlayerState() === YT.PlayerState.PLAYING) {
-        checkLimit(yt.getCurrentTime());
+        var t = yt.getCurrentTime();
+        reportProgress(limit ? t / limit : t / (yt.getDuration() || 1));
+        checkLimit(t);
     }
 }, 250);
 
 // ---------------------------------------------------------------- SoundCloud
-var SC_OPTIONS = { auto_play: true, visual: true, show_comments: false, show_user: true, hide_related: true };
+// Schmaler Player (visual=false) in DawnV-Orange; color nur im URL kodiert, bei load() unkodiert
+var SC_COLOR = "#ff6a3d";
+var SC_OPTIONS = {
+    auto_play: true, visual: false, show_comments: false, show_user: true, hide_related: true,
+    show_artwork: false, show_playcount: false, show_teaser: false, sharing: false, buying: false, download: false
+};
 
 function loadSoundCloud(url) {
     if (!scFrame) {
-        var params = Object.keys(SC_OPTIONS).map(function (k) { return k + "=" + SC_OPTIONS[k]; }).join("&");
+        var params = Object.keys(SC_OPTIONS).map(function (k) { return k + "=" + SC_OPTIONS[k]; }).join("&")
+            + "&color=" + encodeURIComponent(SC_COLOR);
         scFrame = document.createElement("iframe");
         scFrame.allow = "autoplay; encrypted-media";
         scFrame.src = "https://w.soundcloud.com/player/?url=" + encodeURIComponent(url) + "&" + params;
@@ -112,13 +129,16 @@ function loadSoundCloud(url) {
             sc.bind(SC.Widget.Events.FINISH, function () { if (active === "soundcloud" && !limitDone) send({ type: "ended" }); });
             sc.bind(SC.Widget.Events.ERROR, function () { if (active === "soundcloud") send({ type: "error" }); });
             sc.bind(SC.Widget.Events.PLAY_PROGRESS, function (e) {
-                if (active === "soundcloud") checkLimit(e.currentPosition / 1000);
+                if (active !== "soundcloud") return;
+                var s = e.currentPosition / 1000;
+                reportProgress(limit ? s / limit : e.relativePosition);
+                checkLimit(s);
             });
             if (pendingSc) { var next = pendingSc; pendingSc = null; loadSoundCloud(next); }
             else sc.play();
         });
     } else if (scReady) {
-        var opts = Object.assign({}, SC_OPTIONS, { callback: function () { applyVolume(); sc.play(); } });
+        var opts = Object.assign({}, SC_OPTIONS, { color: SC_COLOR, callback: function () { applyVolume(); sc.play(); } });
         sc.load(url, opts);
     } else {
         pendingSc = url;
